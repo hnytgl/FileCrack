@@ -11,6 +11,33 @@ from typing import Iterable
 from .backends import BackendUnavailable, CrackBackend, get_backend
 
 
+WEAK_PASSWORDS = [
+    "123456",
+    "123456789",
+    "12345678",
+    "111111",
+    "000000",
+    "password",
+    "admin",
+    "qwerty",
+    "abc123",
+    "123123",
+    "iloveyou",
+    "letmein",
+    "welcome",
+    "root",
+    "passw0rd",
+    "p@ssw0rd",
+    "password1",
+    "888888",
+    "666666",
+    "1q2w3e4r",
+    "qwer1234",
+    "abcd1234",
+    "1234567890",
+]
+
+
 @dataclass(frozen=True)
 class CrackResult:
     found: bool
@@ -35,20 +62,47 @@ def load_wordlist(path: Path, encoding: str = "utf-8") -> Iterable[str]:
                 yield password
 
 
+def build_candidates(
+    single_password: str | None = None,
+    weak_check: bool = False,
+    wordlist: Path | None = None,
+    encoding: str = "utf-8",
+) -> Iterable[str]:
+    seen: set[str] = set()
+
+    def emit(passwords: Iterable[str]) -> Iterable[str]:
+        for password in passwords:
+            if password not in seen:
+                seen.add(password)
+                yield password
+
+    if single_password is not None:
+        yield from emit([single_password])
+    if weak_check:
+        yield from emit(WEAK_PASSWORDS)
+    if wordlist is not None:
+        yield from emit(load_wordlist(wordlist, encoding=encoding))
+
+
 def crack_file(
     target: Path,
-    wordlist: Path,
+    wordlist: Path | None = None,
     workers: int = 4,
     encoding: str = "utf-8",
     force_format: str | None = None,
     chunk_size: int = 512,
+    single_password: str | None = None,
+    weak_check: bool = False,
 ) -> CrackResult:
     target = target.expanduser().resolve()
-    wordlist = wordlist.expanduser().resolve()
     if not target.exists():
         raise FileNotFoundError(f"目标文件不存在：{target}")
-    if not wordlist.exists():
-        raise FileNotFoundError(f"字典文件不存在：{wordlist}")
+    if wordlist is not None:
+        wordlist = wordlist.expanduser().resolve()
+        if not wordlist.exists():
+            raise FileNotFoundError(f"字典文件不存在：{wordlist}")
+    if single_password is None and not weak_check and wordlist is None:
+        raise ValueError("请至少提供 --password、--weak-check 或 --wordlist 中的一种密码来源。")
 
     backend = get_backend(target, force_format=force_format)
     stop_event = threading.Event()
@@ -57,7 +111,12 @@ def crack_file(
 
     try:
         with ThreadPoolExecutor(max_workers=max(workers, 1)) as executor:
-            passwords = load_wordlist(wordlist, encoding=encoding)
+            passwords = build_candidates(
+                single_password=single_password,
+                weak_check=weak_check,
+                wordlist=wordlist,
+                encoding=encoding,
+            )
             futures = {}
 
             while not stop_event.is_set():
@@ -73,9 +132,9 @@ def crack_file(
 
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
-                    batch_attempts = futures.pop(future)
+                    futures.pop(future)
+                    password, batch_attempts = future.result()
                     attempts += batch_attempts
-                    password = future.result()
                     if password is not None:
                         stop_event.set()
                         elapsed = time.perf_counter() - start
@@ -88,10 +147,17 @@ def crack_file(
         return CrackResult(False, None, attempts, elapsed, backend.name, error=str(exc))
 
 
-def _try_batch(backend: CrackBackend, target: Path, passwords: list[str], stop_event: threading.Event) -> str | None:
+def _try_batch(
+    backend: CrackBackend,
+    target: Path,
+    passwords: list[str],
+    stop_event: threading.Event,
+) -> tuple[str | None, int]:
+    attempts = 0
     for password in passwords:
         if stop_event.is_set():
-            return None
+            return None, attempts
+        attempts += 1
         if backend.verify(target, password):
-            return password
-    return None
+            return password, attempts
+    return None, attempts
